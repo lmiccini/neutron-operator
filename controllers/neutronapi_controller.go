@@ -1267,6 +1267,20 @@ func getExternalSecretName(instance *neutronv1beta1.NeutronAPI, serviceName stri
 	return fmt.Sprintf("%s-%s-neutron-config", instance.Name, serviceName)
 }
 
+// getQuorumQueuesStatus fetches the TransportURL instance and returns whether quorum queues are enabled
+func (r *NeutronAPIReconciler) getQuorumQueuesStatus(ctx context.Context, h *helper.Helper, instance *neutronv1beta1.NeutronAPI) bool {
+	transportURLInstance := &rabbitmqv1.TransportURL{}
+	err := h.GetClient().Get(ctx, types.NamespacedName{
+		Name:      fmt.Sprintf("%s-neutron-transport", instance.Name),
+		Namespace: instance.Namespace,
+	}, transportURLInstance)
+	if err == nil {
+		return transportURLInstance.GetQuorumQueues()
+	}
+	// Default to false if TransportURL not found or error occurred
+	return false
+}
+
 func getMetadataAgentSecretName(instance *neutronv1beta1.NeutronAPI) string {
 	return getExternalSecretName(instance, "ovn-metadata-agent")
 }
@@ -1594,6 +1608,7 @@ func (r *NeutronAPIReconciler) ensureExternalSriovAgentSecret(
 	}
 	templateParameters := make(map[string]interface{})
 	templateParameters["transportURL"] = transportURL
+	templateParameters["QuorumQueues"] = r.getQuorumQueuesStatus(ctx, h, instance)
 
 	secretName := getSriovAgentSecretName(instance)
 	return r.ensureExternalSecret(ctx, h, instance, secretName, templates, templateParameters, envVars)
@@ -1611,6 +1626,7 @@ func (r *NeutronAPIReconciler) ensureExternalDhcpAgentSecret(
 	}
 	templateParameters := make(map[string]interface{})
 	templateParameters["transportURL"] = transportURL
+	templateParameters["QuorumQueues"] = r.getQuorumQueuesStatus(ctx, h, instance)
 
 	secretName := getDhcpAgentSecretName(instance)
 	return r.ensureExternalSecret(ctx, h, instance, secretName, templates, templateParameters, envVars)
@@ -1678,6 +1694,7 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 	templateParameters["KeystoneInternalURL"] = keystoneInternalURL
 	templateParameters["KeystonePublicURL"] = keystonePublicURL
 	templateParameters["TransportURL"] = transportURL
+	templateParameters["QuorumQueues"] = r.getQuorumQueuesStatus(ctx, h, instance)
 	templateParameters["MemcachedServers"] = mc.GetMemcachedServerListString()
 	templateParameters["MemcachedServersWithInet"] = mc.GetMemcachedServerListWithInetString()
 	templateParameters["MemcachedTLS"] = mc.GetMemcachedTLSSupport()
