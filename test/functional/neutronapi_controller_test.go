@@ -765,6 +765,47 @@ func getNeutronAPIControllerSuite(ml2MechanismDrivers []string) func() {
 				}
 			})
 
+			It("should create a Secret for 01-neutron.conf with quorum queues config when transporturl has quorumqueues=true", func() {
+				if isOVNEnabled {
+					DeferCleanup(DeleteOVNDBClusters, CreateOVNDBClusters(namespace))
+				}
+				keystoneAPI := keystone.CreateKeystoneAPI(namespace)
+				DeferCleanup(keystone.DeleteKeystoneAPI, keystoneAPI)
+
+				// Create a transport URL secret with quorumqueues=true
+				quorumTransportSecret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      SecretName,
+						Namespace: namespace,
+					},
+					Data: map[string][]byte{
+						"NeutronPassword": []byte("12345678"),
+						"transport_url":   []byte("rabbit://user@svc:1234"),
+						"quorumqueues":    []byte("true"),
+					},
+				}
+				Expect(k8sClient.Update(ctx, quorumTransportSecret)).Should(Succeed())
+
+				secret := types.NamespacedName{
+					Namespace: neutronAPIName.Namespace,
+					Name:      fmt.Sprintf("%s-%s", neutronAPIName.Name, "config"),
+				}
+
+				Eventually(func() corev1.Secret {
+					return th.GetSecret(secret)
+				}, timeout, interval).ShouldNot(BeNil())
+
+				configData := th.GetSecret(secret)
+				Expect(configData).ShouldNot(BeNil())
+				conf := string(configData.Data["01-neutron.conf"])
+
+				// Verify that the quorum queues configuration is present
+				Expect(conf).Should(ContainSubstring("[oslo_messaging_rabbit]"))
+				Expect(conf).Should(ContainSubstring("rabbit_quorum_queue=true"))
+				Expect(conf).Should(ContainSubstring("rabbit_transient_quorum_queue=true"))
+				Expect(conf).Should(ContainSubstring("amqp_durable_queues=true"))
+			})
+
 			if isOVNEnabled {
 				It("should create an external OVN Agent Secret with expected ovn nb and sb connection set", func() {
 					dbs := CreateOVNDBClusters(namespace)
