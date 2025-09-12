@@ -18,7 +18,6 @@ package controllers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -69,9 +68,6 @@ import (
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-// errTransportURLSecretNameNilOrEmpty
-var errTransportURLSecretNameNilOrEmpty = errors.New("transport_url secret name is nil or empty")
 
 // getlogger returns a logger object with a prefix of "conroller.name" and aditional controller context fields
 func (r *NeutronAPIReconciler) GetLogger(ctx context.Context) logr.Logger {
@@ -1493,49 +1489,13 @@ func (r *NeutronAPIReconciler) reconcileExternalOVNAgentSecret(
 	return nil
 }
 
-func (r *NeutronAPIReconciler) getTransportURL(
-	ctx context.Context,
-	h *helper.Helper,
-	instance *neutronv1beta1.NeutronAPI,
-	secretName *string,
-) (string, error) {
-	if secretName == nil || *secretName == "" {
-		return "", errTransportURLSecretNameNilOrEmpty
-	}
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, *secretName, instance.Namespace)
-	if err != nil {
-		return "", err
-	}
-	transportURL, ok := transportURLSecret.Data["transport_url"]
-	if !ok {
-		return "", fmt.Errorf("transport_url %w Transport Secret", util.ErrNotFound)
-	}
-	return string(transportURL), nil
-}
-
-func (r *NeutronAPIReconciler) isQuorumQueuesEnabled(
-	ctx context.Context,
-	h *helper.Helper,
-	instance *neutronv1beta1.NeutronAPI,
-) (bool, error) {
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
-	if err != nil {
-		return false, err
-	}
-	quorumQueues, ok := transportURLSecret.Data["quorumqueues"]
-	if !ok {
-		return false, nil
-	}
-	return string(quorumQueues) == "true", nil
-}
-
 func (r *NeutronAPIReconciler) reconcileExternalSriovAgentSecret(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
 ) error {
-	transportURL, err := r.getTransportURL(ctx, h, instance, &instance.Status.TransportURLSecret)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
 	if err != nil {
 		err = r.deleteExternalSecret(ctx, h, instance, getSriovAgentSecretName(instance))
 		if err != nil {
@@ -1543,7 +1503,18 @@ func (r *NeutronAPIReconciler) reconcileExternalSriovAgentSecret(
 		}
 		return nil
 	}
-	err = r.ensureExternalSriovAgentSecret(ctx, h, instance, transportURL, envVars)
+	transportURLData, ok := transportURLSecret.Data["transport_url"]
+	if !ok {
+		err = r.deleteExternalSecret(ctx, h, instance, getSriovAgentSecretName(instance))
+		if err != nil {
+			return fmt.Errorf("failed to delete Neutron SR-IOV Agent external Secret: %w", err)
+		}
+		return nil
+	}
+	transportURL := string(transportURLData)
+	quorumQueuesData, ok := transportURLSecret.Data["quorumqueues"]
+	quorumQueues := ok && string(quorumQueuesData) == "true"
+	err = r.ensureExternalSriovAgentSecret(ctx, h, instance, transportURL, quorumQueues, envVars)
 	if err != nil {
 		return fmt.Errorf("failed to ensure Neutron SR-IOV Agent external Secret: %w", err)
 	}
@@ -1572,7 +1543,9 @@ func (r *NeutronAPIReconciler) reconcileExternalDhcpAgentSecret(
 		}
 		return nil
 	}
-	err = r.ensureExternalDhcpAgentSecret(ctx, h, instance, string(transportURL), envVars)
+	quorumQueuesData, ok := transportURLSecret.Data["quorumqueues"]
+	quorumQueues := ok && string(quorumQueuesData) == "true"
+	err = r.ensureExternalDhcpAgentSecret(ctx, h, instance, string(transportURL), quorumQueues, envVars)
 	if err != nil {
 		return fmt.Errorf("failed to ensure Neutron DHCP Agent external Secret: %w", err)
 	}
@@ -1724,6 +1697,7 @@ func (r *NeutronAPIReconciler) ensureExternalSriovAgentSecret(
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	transportURL string,
+	quorumQueues bool,
 	envVars *map[string]env.Setter,
 ) error {
 	templates := map[string]string{
@@ -1731,10 +1705,6 @@ func (r *NeutronAPIReconciler) ensureExternalSriovAgentSecret(
 	}
 	templateParameters := make(map[string]interface{})
 	templateParameters["transportURL"] = transportURL
-	quorumQueues, err := r.isQuorumQueuesEnabled(ctx, h, instance)
-	if err != nil {
-		return err
-	}
 	templateParameters["QuorumQueues"] = quorumQueues
 
 	secretName := getSriovAgentSecretName(instance)
@@ -1746,6 +1716,7 @@ func (r *NeutronAPIReconciler) ensureExternalDhcpAgentSecret(
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	transportURL string,
+	quorumQueues bool,
 	envVars *map[string]env.Setter,
 ) error {
 	templates := map[string]string{
@@ -1753,10 +1724,6 @@ func (r *NeutronAPIReconciler) ensureExternalDhcpAgentSecret(
 	}
 	templateParameters := make(map[string]interface{})
 	templateParameters["transportURL"] = transportURL
-	quorumQueues, err := r.isQuorumQueuesEnabled(ctx, h, instance)
-	if err != nil {
-		return err
-	}
 	templateParameters["QuorumQueues"] = quorumQueues
 
 	secretName := getDhcpAgentSecretName(instance)
@@ -1805,7 +1772,7 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 		return err
 	}
 
-	transportURL, err := r.getTransportURL(ctx, h, instance, &instance.Status.TransportURLSecret)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.InputReadyCondition,
@@ -1815,11 +1782,14 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 		))
 		return err
 	}
-
-	quorumQueues, err := r.isQuorumQueuesEnabled(ctx, h, instance)
-	if err != nil {
-		return err
+	transportURLData, ok := transportURLSecret.Data["transport_url"]
+	if !ok {
+		return fmt.Errorf("transport_url %w Transport Secret", util.ErrNotFound)
 	}
+	transportURL := string(transportURLData)
+
+	quorumQueuesData, ok := transportURLSecret.Data["quorumqueues"]
+	quorumQueues := ok && string(quorumQueuesData) == "true"
 
 	mc, err := memcachedv1.GetMemcachedByName(ctx, h, instance.Spec.MemcachedInstance, instance.Namespace)
 	if err != nil {
@@ -1842,13 +1812,14 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 	templateParameters["TimeOut"] = instance.Spec.APITimeout
 	templateParameters["QuorumQueues"] = quorumQueues
 
-	notificationsTransportURL, err := r.getTransportURL(ctx, h, instance, instance.Status.NotificationsTransportURLSecret)
-	if err != nil && !errors.Is(err, errTransportURLSecretNameNilOrEmpty) {
-		// in case not configured yet.
-		return err
-	}
-	if notificationsTransportURL != "" {
-		templateParameters["NotificationsTransportURL"] = notificationsTransportURL
+	if instance.Status.NotificationsTransportURLSecret != nil && *instance.Status.NotificationsTransportURLSecret != "" {
+		notificationsTransportURLSecret, _, err := secret.GetSecret(ctx, h, *instance.Status.NotificationsTransportURLSecret, instance.Namespace)
+		if err != nil {
+			return err
+		}
+		if notificationsTransportURLData, ok := notificationsTransportURLSecret.Data["transport_url"]; ok {
+			templateParameters["NotificationsTransportURL"] = string(notificationsTransportURLData)
+		}
 	}
 
 	// MTLS

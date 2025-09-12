@@ -772,28 +772,30 @@ func getNeutronAPIControllerSuite(ml2MechanismDrivers []string) func() {
 				keystoneAPI := keystone.CreateKeystoneAPI(namespace)
 				DeferCleanup(keystone.DeleteKeystoneAPI, keystoneAPI)
 
-				// Create a transport URL secret with quorumqueues=true
-				quorumTransportSecret := &corev1.Secret{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      SecretName,
-						Namespace: namespace,
-					},
-					Data: map[string][]byte{
-						"NeutronPassword": []byte("12345678"),
-						"transport_url":   []byte("rabbit://user@svc:1234"),
-						"quorumqueues":    []byte("true"),
-					},
+				// Get the existing secret first to obtain the ResourceVersion
+				existingSecret := &corev1.Secret{}
+				secretKey := types.NamespacedName{
+					Name:      SecretName,
+					Namespace: namespace,
 				}
-				Expect(k8sClient.Update(ctx, quorumTransportSecret)).Should(Succeed())
+				Expect(k8sClient.Get(ctx, secretKey, existingSecret)).Should(Succeed())
+
+				// Update the secret with quorumqueues=true
+				existingSecret.Data["quorumqueues"] = []byte("true")
+				Expect(k8sClient.Update(ctx, existingSecret)).Should(Succeed())
 
 				secret := types.NamespacedName{
 					Namespace: neutronAPIName.Namespace,
 					Name:      fmt.Sprintf("%s-%s", neutronAPIName.Name, "config"),
 				}
 
-				Eventually(func() corev1.Secret {
-					return th.GetSecret(secret)
-				}, timeout, interval).ShouldNot(BeNil())
+				// Wait for the configuration to be regenerated after the secret update
+				Eventually(func(g Gomega) {
+					configData := th.GetSecret(secret)
+					g.Expect(configData).ShouldNot(BeNil())
+					conf := string(configData.Data["01-neutron.conf"])
+					g.Expect(conf).Should(ContainSubstring("[oslo_messaging_rabbit]"))
+				}, timeout, interval).Should(Succeed())
 
 				configData := th.GetSecret(secret)
 				Expect(configData).ShouldNot(BeNil())
