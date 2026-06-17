@@ -504,6 +504,47 @@ func (r *NeutronAPIReconciler) reconcileDelete(ctx context.Context, instance *ne
 			return ctrl.Result{}, err
 		}
 	}
+	transportSecretName := instance.Status.TransportURLSecret
+	if transportSecretName == "" {
+		transportURL := &rabbitmqv1.TransportURL{}
+		transportURLName := types.NamespacedName{
+			Name:      fmt.Sprintf("%s-neutron-transport", instance.Name),
+			Namespace: instance.Namespace,
+		}
+		if err := helper.GetClient().Get(ctx, transportURLName, transportURL); err == nil {
+			transportSecretName = transportURL.Status.SecretName
+		}
+	}
+	if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+		ctx, helper, instance.Namespace,
+		transportSecretName,
+		neutronv1beta1.NeutronTransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	notifSecretName := ""
+	if instance.Status.NotificationsTransportURLSecret != nil {
+		notifSecretName = *instance.Status.NotificationsTransportURLSecret
+	}
+	if notifSecretName == "" {
+		notifTransportURL := &rabbitmqv1.TransportURL{}
+		notifTransportURLName := types.NamespacedName{
+			Name:      "notifications-neutron-transport",
+			Namespace: instance.Namespace,
+		}
+		if err := helper.GetClient().Get(ctx, notifTransportURLName, notifTransportURL); err == nil {
+			notifSecretName = notifTransportURL.Status.SecretName
+		}
+	}
+	if notifSecretName != "" {
+		if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+			ctx, helper, instance.Namespace,
+			notifSecretName,
+			neutronv1beta1.NeutronTransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// Service is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
@@ -519,6 +560,8 @@ func (r *NeutronAPIReconciler) reconcileInit(
 	serviceLabels map[string]string,
 	serviceAnnotations map[string]string,
 	secretVars map[string]env.Setter,
+	transportURLSecretName string,
+	notificationsTransportURLSecretName *string,
 ) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service init")
@@ -536,7 +579,7 @@ func (r *NeutronAPIReconciler) reconcileInit(
 	//
 	// create Secret required for neutronapi and dbsync input. It contains minimal neutron config required
 	// to get the service up, user can add additional files to be added to the service.
-	err = r.generateServiceSecrets(ctx, helper, instance, &secretVars, db)
+	err = r.generateServiceSecrets(ctx, helper, instance, &secretVars, db, transportURLSecretName, notificationsTransportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -972,9 +1015,7 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 		return ctrl.Result{}, err
 	}
 
-	instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-	if instance.Status.TransportURLSecret == "" {
+	if transportURL.Status.SecretName == "" {
 		Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -996,10 +1037,11 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 	// notifications transporturl
 	// (the webhook defaults NotificationsBus from the deprecated NotificationsBusInstance field)
 	//
+	var notificationTransportURL *rabbitmqv1.TransportURL
 	if instance.Spec.NotificationsBus != nil && instance.Spec.NotificationsBus.Cluster != "" {
 		// Use NotificationsBus config (never fall back to MessagingBus to ensure separation)
 		notificationsRabbitMqConfig := *instance.Spec.NotificationsBus
-		notificationTransportURL, _, err := r.transportURLCreateOrUpdate(
+		notificationTransportURL, _, err = r.transportURLCreateOrUpdate(
 			ctx, instance, "notifications", notificationsRabbitMqConfig)
 
 		if err != nil {
@@ -1047,10 +1089,21 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 			return result, err
 		}
 
-		instance.Status.NotificationsTransportURLSecret = &notificationTransportURL.Status.SecretName
+		if err := rabbitmqv1.ManageTransportSecretFinalizer(
+			ctx, helper, instance.Namespace,
+			notificationTransportURL.Status.SecretName,
+			neutronv1beta1.NeutronTransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
 		Log.Info(fmt.Sprintf("Notifications TransportURL %s secret created Successfully ", notificationTransportURL.Name))
 
-		secretVars[instance.Status.TransportURLSecret] = env.SetValue(notificationsTransportURLSecretHash)
+		if instance.Status.NotificationsTransportURLSecret == nil ||
+			*instance.Status.NotificationsTransportURLSecret == notificationTransportURL.Status.SecretName {
+			instance.Status.NotificationsTransportURLSecret = &notificationTransportURL.Status.SecretName
+		}
+
+		secretVars[transportURL.Status.SecretName] = env.SetValue(notificationsTransportURLSecretHash)
 		instance.Status.Conditions.MarkTrue(condition.NotificationBusInstanceReadyCondition, condition.NotificationBusInstanceReadyMessage)
 	} else {
 		instance.Status.NotificationsTransportURLSecret = nil
@@ -1072,7 +1125,7 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 
 	transportURLSecretHash, result, err := secret.VerifySecretFields(
 		ctx,
-		types.NamespacedName{Namespace: instance.Namespace, Name: instance.Status.TransportURLSecret},
+		types.NamespacedName{Namespace: instance.Namespace, Name: transportURL.Status.SecretName},
 		transportValidateFields,
 		helper.GetClient(),
 		time.Duration(10)*time.Second,
@@ -1094,7 +1147,20 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 		return result, err
 	}
 
-	secretVars[instance.Status.TransportURLSecret] = env.SetValue(transportURLSecretHash)
+	secretVars[transportURL.Status.SecretName] = env.SetValue(transportURLSecretHash)
+
+	if err := rabbitmqv1.ManageTransportSecretFinalizer(
+		ctx, helper, instance.Namespace,
+		transportURL.Status.SecretName,
+		neutronv1beta1.NeutronTransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if instance.Status.TransportURLSecret == "" ||
+		instance.Status.TransportURLSecret == transportURL.Status.SecretName {
+		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	}
 
 	// run check TransportURL secret - end
 
@@ -1183,7 +1249,7 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 	//
 	// reconcile external secrets and mark condition
 	//
-	err = r.reconcileExternalSecrets(ctx, helper, instance, &secretVars)
+	err = r.reconcileExternalSecrets(ctx, helper, instance, &secretVars, transportURL.Status.SecretName)
 	if err != nil {
 		Log.Error(err, "Failed to reconcile external Secrets")
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -1257,7 +1323,11 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 	}
 
 	// Handle service init
-	ctrlResult, err := r.reconcileInit(ctx, instance, helper, serviceLabels, serviceAnnotations, secretVars)
+	var notificationsSecretName *string
+	if notificationTransportURL != nil {
+		notificationsSecretName = &notificationTransportURL.Status.SecretName
+	}
+	ctrlResult, err := r.reconcileInit(ctx, instance, helper, serviceLabels, serviceAnnotations, secretVars, transportURL.Status.SecretName, notificationsSecretName)
 	if err != nil {
 		return ctrlResult, err
 	} else if (ctrlResult != ctrl.Result{}) {
@@ -1396,6 +1466,39 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 				condition.SeverityInfo,
 				condition.DeploymentReadyRunningMessage))
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DeploymentReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
+	}
+	// Guard against stale informer cache: the deployment helper re-reads
+	// the deployment from cache after CreateOrPatch, which may return a
+	// pre-update version where Generation == ObservedGeneration. If the
+	// deployed CONFIG_HASH doesn't match the current inputHash, the cached
+	// object is stale and the deployment isn't actually running the latest
+	// configuration yet.
+	if instance.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+		deployedConfigHash := ""
+		for _, container := range deploy.Spec.Template.Spec.Containers {
+			for _, envVar := range container.Env {
+				if envVar.Name == "CONFIG_HASH" {
+					deployedConfigHash = envVar.Value
+					break
+				}
+			}
+			if deployedConfigHash != "" {
+				break
+			}
+		}
+		if deployedConfigHash != inputHash {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				condition.DeploymentReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				condition.DeploymentReadyRunningMessage))
+		}
 	}
 	// create Deployment - end
 	if instance.Status.ReadyCount > 0 {
@@ -1424,6 +1527,44 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 		}
 	} else {
 		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
+	}
+
+	isTransportRotation := instance.Status.TransportURLSecret != "" &&
+		instance.Status.TransportURLSecret != transportURL.Status.SecretName
+
+	if isTransportRotation {
+		if instance.Status.Conditions.AllSubConditionIsTrue() {
+			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+				ctx, helper, instance.Namespace,
+				instance.Status.TransportURLSecret,
+				neutronv1beta1.NeutronTransportConsumerFinalizer,
+			); err != nil {
+				return ctrl.Result{}, err
+			}
+			instance.Status.TransportURLSecret = transportURL.Status.SecretName
+		}
+	} else {
+		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	}
+
+	if notificationTransportURL != nil {
+		isNotifRotation := instance.Status.NotificationsTransportURLSecret != nil &&
+			*instance.Status.NotificationsTransportURLSecret != notificationTransportURL.Status.SecretName
+
+		if isNotifRotation {
+			if instance.Status.Conditions.AllSubConditionIsTrue() {
+				if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+					ctx, helper, instance.Namespace,
+					*instance.Status.NotificationsTransportURLSecret,
+					neutronv1beta1.NeutronTransportConsumerFinalizer,
+				); err != nil {
+					return ctrl.Result{}, err
+				}
+				instance.Status.NotificationsTransportURLSecret = &notificationTransportURL.Status.SecretName
+			}
+		} else {
+			instance.Status.NotificationsTransportURLSecret = &notificationTransportURL.Status.SecretName
+		}
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
@@ -1641,8 +1782,9 @@ func (r *NeutronAPIReconciler) reconcileExternalSriovAgentSecret(
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
+	transportURLSecretName string,
 ) error {
-	transportURL, quorumQueues, err := r.getTransportURL(ctx, h, instance, &instance.Status.TransportURLSecret)
+	transportURL, quorumQueues, err := r.getTransportURL(ctx, h, instance, &transportURLSecretName)
 	if err != nil {
 		err = r.deleteExternalSecret(ctx, h, instance, getSriovAgentSecretName(instance))
 		if err != nil {
@@ -1662,8 +1804,9 @@ func (r *NeutronAPIReconciler) reconcileExternalDhcpAgentSecret(
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
+	transportURLSecretName string,
 ) error {
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, transportURLSecretName, instance.Namespace)
 	if err != nil {
 		err = r.deleteExternalSecret(ctx, h, instance, getDhcpAgentSecretName(instance))
 		if err != nil {
@@ -1694,14 +1837,15 @@ func (r *NeutronAPIReconciler) reconcileExternalSecrets(
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
+	transportURLSecretName string,
 ) error {
 	Log := r.GetLogger(ctx)
 	// Generate one Secret per external service
-	err := r.reconcileExternalSriovAgentSecret(ctx, h, instance, envVars)
+	err := r.reconcileExternalSriovAgentSecret(ctx, h, instance, envVars, transportURLSecretName)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile Neutron SR-IOV Agent external Secret: %w", err)
 	}
-	err = r.reconcileExternalDhcpAgentSecret(ctx, h, instance, envVars)
+	err = r.reconcileExternalDhcpAgentSecret(ctx, h, instance, envVars, transportURLSecretName)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile Neutron DHCP Agent external Secret: %w", err)
 	}
@@ -1874,6 +2018,8 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
 	db *mariadbv1.Database,
+	transportURLSecretName string,
+	notificationsTransportURLSecretName *string,
 ) error {
 	// Create/update secrets from templates
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(neutronapi.ServiceName), map[string]string{})
@@ -1905,7 +2051,7 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 		return err
 	}
 
-	transportURL, quorumQueues, err := r.getTransportURL(ctx, h, instance, &instance.Status.TransportURLSecret)
+	transportURL, quorumQueues, err := r.getTransportURL(ctx, h, instance, &transportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.InputReadyCondition,
@@ -1938,7 +2084,7 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 	templateParameters["TimeOut"] = instance.Spec.APITimeout
 	templateParameters["QuorumQueues"] = quorumQueues
 
-	notificationsTransportURL, _, err := r.getTransportURL(ctx, h, instance, instance.Status.NotificationsTransportURLSecret)
+	notificationsTransportURL, _, err := r.getTransportURL(ctx, h, instance, notificationsTransportURLSecretName)
 	if err != nil && !errors.Is(err, errTransportURLSecretNameNilOrEmpty) {
 		// in case not configured yet.
 		return err

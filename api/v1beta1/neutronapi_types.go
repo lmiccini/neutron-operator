@@ -30,6 +30,11 @@ import (
 )
 
 const (
+	// NeutronTransportConsumerFinalizer is added to transport secrets that
+	// NeutronAPI is actively consuming, preventing premature deletion
+	// during credential rotation.
+	NeutronTransportConsumerFinalizer = "openstack.org/neutron-transport-consumer"
+
 	// DbSyncHash hash
 	DbSyncHash = "dbsync"
 

@@ -2374,6 +2374,156 @@ func getNeutronAPIControllerSuite(ml2MechanismDrivers []string) func() {
 				}, timeout, interval).Should(Succeed())
 			})
 		})
+
+		When("TransportURL consumer finalizer is managed", func() {
+			BeforeEach(func() {
+				DeferCleanup(th.DeleteInstance, CreateNeutronAPI(neutronAPIName.Namespace, neutronAPIName.Name, spec))
+				DeferCleanup(k8sClient.Delete, ctx, CreateNeutronAPISecret(namespace, SecretName))
+				DeferCleanup(infra.DeleteMemcached, infra.CreateMemcached(namespace, "memcached", memcachedSpec))
+				infra.SimulateMemcachedReady(memcachedName)
+				DeferCleanup(
+					mariadb.DeleteDBService,
+					mariadb.CreateDBService(
+						namespace,
+						GetNeutronAPI(neutronAPIName).Spec.DatabaseInstance,
+						corev1.ServiceSpec{
+							Ports: []corev1.ServicePort{{Port: 3306}},
+						},
+					),
+				)
+				SimulateTransportURLReady(apiTransportURLName)
+				mariadb.SimulateMariaDBAccountCompleted(types.NamespacedName{Namespace: namespace, Name: GetNeutronAPI(neutronAPIName).Spec.DatabaseAccount})
+				mariadb.SimulateMariaDBDatabaseCompleted(types.NamespacedName{Namespace: namespace, Name: neutronapi.DatabaseCRName})
+
+				if isOVNEnabled {
+					DeferCleanup(DeleteOVNDBClusters, CreateOVNDBClusters(namespace))
+				}
+				DeferCleanup(keystone.DeleteKeystoneAPI, keystone.CreateKeystoneAPI(namespace))
+			})
+
+			It("should add the consumer finalizer to the transport secret", func() {
+				Eventually(func(g Gomega) {
+					secret := th.GetSecret(types.NamespacedName{
+						Namespace: neutronAPIName.Namespace,
+						Name:      SecretName,
+					})
+					g.Expect(secret.Finalizers).To(
+						ContainElement(neutronv1.NeutronTransportConsumerFinalizer))
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should remove the consumer finalizer from transport secret on CR deletion", func() {
+				Eventually(func(g Gomega) {
+					secret := th.GetSecret(types.NamespacedName{
+						Namespace: neutronAPIName.Namespace,
+						Name:      SecretName,
+					})
+					g.Expect(secret.Finalizers).To(
+						ContainElement(neutronv1.NeutronTransportConsumerFinalizer))
+				}, timeout, interval).Should(Succeed())
+
+				th.DeleteInstance(GetNeutronAPI(neutronAPIName))
+
+				Eventually(func(g Gomega) {
+					secret := th.GetSecret(types.NamespacedName{
+						Namespace: neutronAPIName.Namespace,
+						Name:      SecretName,
+					})
+					g.Expect(secret.Finalizers).NotTo(
+						ContainElement(neutronv1.NeutronTransportConsumerFinalizer))
+				}, timeout, interval).Should(Succeed())
+			})
+
+			It("should move the finalizer from the old to the new secret on transport rotation", func() {
+				oldSecretName := SecretName
+
+				// Wait for the consumer finalizer to be added to the old secret
+				Eventually(func(g Gomega) {
+					secret := th.GetSecret(types.NamespacedName{
+						Namespace: neutronAPIName.Namespace,
+						Name:      oldSecretName,
+					})
+					g.Expect(secret.Finalizers).To(
+						ContainElement(neutronv1.NeutronTransportConsumerFinalizer))
+				}, timeout, interval).Should(Succeed())
+
+				// Get NeutronAPI to fully ready state
+				th.SimulateJobSuccess(neutronDBSyncJobName)
+				th.SimulateDeploymentReplicaReady(neutronDeploymentName)
+				keystone.SimulateKeystoneServiceReady(types.NamespacedName{
+					Namespace: namespace,
+					Name:      "neutron",
+				})
+				keystone.SimulateKeystoneEndpointReady(types.NamespacedName{
+					Namespace: namespace,
+					Name:      "neutron",
+				})
+				Eventually(func(g Gomega) {
+					n := GetNeutronAPI(neutronAPIName)
+					g.Expect(n.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+					g.Expect(n.Status.TransportURLSecret).To(Equal(oldSecretName))
+				}, timeout, interval).Should(Succeed())
+
+				// Create a new rotated secret with different content
+				newSecretName := "rabbitmq-secret-rotated"
+				newSecret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: namespace,
+						Name:      newSecretName,
+					},
+					Data: map[string][]byte{
+						"transport_url": []byte("rabbit://rotated-user:rotated-pass@rabbitmq/fake"),
+					},
+				}
+				DeferCleanup(k8sClient.Delete, ctx, newSecret)
+				Expect(k8sClient.Create(ctx, newSecret)).To(Succeed())
+
+				// Simulate transport rotation: update TransportURL status with new secret name
+				Eventually(func(g Gomega) {
+					transport := infra.GetTransportURL(apiTransportURLName)
+					transport.Status.SecretName = newSecretName
+					g.Expect(k8sClient.Status().Update(ctx, transport)).To(Succeed())
+				}, timeout, interval).Should(Succeed())
+
+				// Verify finalizer is added to the new secret
+				Eventually(func(g Gomega) {
+					secret := th.GetSecret(types.NamespacedName{
+						Namespace: namespace,
+						Name:      newSecretName,
+					})
+					g.Expect(secret.Finalizers).To(
+						ContainElement(neutronv1.NeutronTransportConsumerFinalizer))
+				}, timeout, interval).Should(Succeed())
+
+				// The old secret's finalizer should NOT be removed yet — deployment
+				// is re-deploying with new credentials and is not ready
+				Consistently(func(g Gomega) {
+					secret := th.GetSecret(types.NamespacedName{
+						Namespace: namespace,
+						Name:      oldSecretName,
+					})
+					g.Expect(secret.Finalizers).To(
+						ContainElement(neutronv1.NeutronTransportConsumerFinalizer))
+				}, timeout, interval).Should(Succeed())
+
+				// Simulate deployment becoming ready with the new credentials
+				Eventually(func(g Gomega) {
+					th.SimulateDeploymentReplicaReady(neutronDeploymentName)
+					secret := th.GetSecret(types.NamespacedName{
+						Namespace: namespace,
+						Name:      oldSecretName,
+					})
+					g.Expect(secret.Finalizers).NotTo(
+						ContainElement(neutronv1.NeutronTransportConsumerFinalizer))
+				}, timeout, interval).Should(Succeed())
+
+				// Verify status tracks the new secret
+				Eventually(func(g Gomega) {
+					n := GetNeutronAPI(neutronAPIName)
+					g.Expect(n.Status.TransportURLSecret).To(Equal(newSecretName))
+				}, timeout, interval).Should(Succeed())
+			})
+		})
 	}
 }
 
