@@ -1529,42 +1529,34 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
 	}
 
-	isTransportRotation := instance.Status.TransportURLSecret != "" &&
-		instance.Status.TransportURLSecret != transportURL.Status.SecretName
-
-	if isTransportRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
-			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-				ctx, helper, instance.Namespace,
-				instance.Status.TransportURLSecret,
-				neutronv1beta1.NeutronTransportConsumerFinalizer,
-			); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.TransportURLSecret = transportURL.Status.SecretName
-		}
-	} else {
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	secretName, err := rabbitmqv1.FinalizeTransportSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		transportURL.Status.SecretName,
+		neutronv1beta1.NeutronTransportConsumerFinalizer,
+		instance.Status.Conditions.AllSubConditionIsTrue(),
+	)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	instance.Status.TransportURLSecret = secretName
 
 	if notificationTransportURL != nil {
-		isNotifRotation := instance.Status.NotificationsTransportURLSecret != nil &&
-			*instance.Status.NotificationsTransportURLSecret != notificationTransportURL.Status.SecretName
-
-		if isNotifRotation {
-			if instance.Status.Conditions.AllSubConditionIsTrue() {
-				if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-					ctx, helper, instance.Namespace,
-					*instance.Status.NotificationsTransportURLSecret,
-					neutronv1beta1.NeutronTransportConsumerFinalizer,
-				); err != nil {
-					return ctrl.Result{}, err
-				}
-				instance.Status.NotificationsTransportURLSecret = &notificationTransportURL.Status.SecretName
-			}
-		} else {
-			instance.Status.NotificationsTransportURLSecret = &notificationTransportURL.Status.SecretName
+		statusNotifSecret := ""
+		if instance.Status.NotificationsTransportURLSecret != nil {
+			statusNotifSecret = *instance.Status.NotificationsTransportURLSecret
 		}
+		notifSecretName, err := rabbitmqv1.FinalizeTransportSecretRotation(
+			ctx, helper, instance.Namespace,
+			statusNotifSecret,
+			notificationTransportURL.Status.SecretName,
+			neutronv1beta1.NeutronTransportConsumerFinalizer,
+			instance.Status.Conditions.AllSubConditionIsTrue(),
+		)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		instance.Status.NotificationsTransportURLSecret = &notifSecretName
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
