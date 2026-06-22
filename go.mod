@@ -7,7 +7,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/k8snetworkplumbingwg/network-attachment-definition-client v1.7.7
 	github.com/onsi/ginkgo/v2 v2.28.2
-	github.com/onsi/gomega v1.41.0
+	github.com/onsi/gomega v1.42.0
 	github.com/openstack-k8s-operators/infra-operator/apis v0.6.1-0.20260610094512-d6e7a2257c1a
 	github.com/openstack-k8s-operators/keystone-operator/api v0.6.1-0.20260611162428-f51ec7d13a8b
 	github.com/openstack-k8s-operators/lib-common/modules/common v0.6.1-0.20260610101308-d3778a549c89
@@ -64,7 +64,7 @@ require (
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/openshift/api v3.9.0+incompatible // indirect
-	github.com/openstack-k8s-operators/lib-common/modules/openstack v0.6.1-0.20260526114926-7ebfadd589db // indirect
+	github.com/openstack-k8s-operators/lib-common/modules/openstack v0.6.1-0.20260610101308-d3778a549c89 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.22.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
@@ -117,6 +117,12 @@ require (
 )
 
 replace github.com/openstack-k8s-operators/neutron-operator/api => ./api
+
+replace github.com/openstack-k8s-operators/lib-common/modules/common => github.com/lmiccini/lib-common/modules/common v0.0.0-20260622102304-6eac5e449074
+
+replace github.com/openstack-k8s-operators/infra-operator/apis => github.com/lmiccini/infra-operator/apis v0.0.0-20260620072433-7bda5c00b68f
+
+replace github.com/openstack-k8s-operators/keystone-operator/api => github.com/lmiccini/keystone-operator/api v0.0.0-20260620073840-e242ef5877eb
 
 // mschuppert: map to latest commit from release-4.18 tag
 // must consistent within modules and service operators
