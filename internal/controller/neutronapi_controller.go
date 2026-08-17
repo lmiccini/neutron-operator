@@ -55,6 +55,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/job"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
@@ -87,8 +88,9 @@ func (r *NeutronAPIReconciler) GetLogger(ctx context.Context) logr.Logger {
 // NeutronAPIReconciler reconciles a NeutronAPI object
 type NeutronAPIReconciler struct {
 	client.Client
-	Kclient kubernetes.Interface
-	Scheme  *runtime.Scheme
+	Kclient   kubernetes.Interface
+	Scheme    *runtime.Scheme
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=neutron.openstack.org,resources=neutronapis,verbs=get;list;watch;create;update;patch;delete
@@ -491,6 +493,34 @@ func (r *NeutronAPIReconciler) reconcileDelete(ctx context.Context, instance *ne
 	); err != nil {
 		return ctrlResult, err
 	}
+	// Remove transport URL consumer finalizers.
+	// Collect secrets from both status (may hold the old secret during rotation)
+	// and the live TransportURL CRs (hold the new secret) to ensure no
+	// consumer finalizer is leaked mid-rotation.
+	transportSecrets := []string{instance.Status.TransportURLSecret}
+	for _, tuName := range []string{
+		fmt.Sprintf("%s-neutron-transport", instance.Name),
+		"notifications-neutron-transport",
+	} {
+		tu := &rabbitmqv1.TransportURL{}
+		if err := r.Get(ctx, types.NamespacedName{Name: tuName, Namespace: instance.Namespace}, tu); err != nil {
+			if !k8s_errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		} else {
+			transportSecrets = append(transportSecrets, tu.Status.SecretName)
+		}
+	}
+	if instance.Status.NotificationsTransportURLSecret != nil {
+		transportSecrets = append(transportSecrets, *instance.Status.NotificationsTransportURLSecret)
+	}
+	for _, secretName := range transportSecrets {
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			secretName, neutronapi.TransportConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Remove consumer finalizer from AC secrets NeutronAPI was consuming.
 	// Check both status and spec to handle the edge case where the reconciler
 	// crashed after adding the finalizer but before updating the status.
@@ -498,7 +528,7 @@ func (r *NeutronAPIReconciler) reconcileDelete(ctx context.Context, instance *ne
 		instance.Status.ApplicationCredentialSecret,
 		instance.Spec.Auth.ApplicationCredentialSecret,
 	} {
-		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, neutronapi.ACConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -518,6 +548,8 @@ func (r *NeutronAPIReconciler) reconcileInit(
 	serviceLabels map[string]string,
 	serviceAnnotations map[string]string,
 	secretVars map[string]env.Setter,
+	transportURLSecretName string,
+	notificationsTransportURLSecretName *string,
 ) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info("Reconciling Service init")
@@ -535,7 +567,7 @@ func (r *NeutronAPIReconciler) reconcileInit(
 	//
 	// create Secret required for neutronapi and dbsync input. It contains minimal neutron config required
 	// to get the service up, user can add additional files to be added to the service.
-	err = r.generateServiceSecrets(ctx, helper, instance, &secretVars, db)
+	err = r.generateServiceSecrets(ctx, helper, instance, &secretVars, db, transportURLSecretName, notificationsTransportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -643,7 +675,7 @@ func (r *NeutronAPIReconciler) reconcileInit(
 	// create hash over all the different input resources to identify if any those changed
 	// and a restart/recreate is required.
 	//
-	hashChanged, err := r.createHashOfInputHashes(ctx, instance, secretVars)
+	_, err = r.createHashOfInputHashes(ctx, instance, secretVars)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -652,10 +684,6 @@ func (r *NeutronAPIReconciler) reconcileInit(
 			condition.ServiceConfigReadyErrorMessage,
 			err.Error()))
 		return ctrl.Result{}, err
-	} else if hashChanged {
-		// Hash changed and instance status should be updated (which will be done by main defer func),
-		// so we need to return and reconcile again
-		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Create Secrets - end
@@ -664,9 +692,8 @@ func (r *NeutronAPIReconciler) reconcileInit(
 	// The old secret's finalizer is removed later (after all services deploy)
 	// so that rapid rotations don't revoke a credential still in use by pods.
 	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
-		if err := keystonev1.ManageACSecretFinalizer(ctx, helper, instance.Namespace,
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			instance.Spec.Auth.ApplicationCredentialSecret,
-			"",
 			neutronapi.ACConsumerFinalizer); err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.ServiceConfigReadyCondition,
@@ -966,9 +993,9 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 		return ctrl.Result{}, err
 	}
 
-	instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	currentTransportSecret := transportURL.Status.SecretName
 
-	if instance.Status.TransportURLSecret == "" {
+	if currentTransportSecret == "" {
 		Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -978,6 +1005,19 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 			condition.RabbitMqTransportURLReadyRunningMessage))
 
 		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+	}
+
+	// Set status early for first-time setup so PatchInstance persists it
+	// even on early returns. During rotation (old != current), the status
+	// is only updated by FinalizeSecretRotation at end of reconcile.
+	if instance.Status.TransportURLSecret == "" ||
+		instance.Status.TransportURLSecret == currentTransportSecret {
+		instance.Status.TransportURLSecret = currentTransportSecret
+	}
+
+	if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		currentTransportSecret, neutronapi.TransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// transportURLFields are not pure password fields. We do not associate a
@@ -990,10 +1030,12 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 	// notifications transporturl
 	// (the webhook defaults NotificationsBus from the deprecated NotificationsBusInstance field)
 	//
+	var notificationTransportURL *rabbitmqv1.TransportURL
+
 	if instance.Spec.NotificationsBus != nil && instance.Spec.NotificationsBus.Cluster != "" {
 		// Use NotificationsBus config (never fall back to MessagingBus to ensure separation)
 		notificationsRabbitMqConfig := *instance.Spec.NotificationsBus
-		notificationTransportURL, _, err := r.transportURLCreateOrUpdate(
+		notificationTransportURL, _, err = r.transportURLCreateOrUpdate(
 			ctx, instance, "notifications", notificationsRabbitMqConfig)
 
 		if err != nil {
@@ -1041,12 +1083,30 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 			return result, err
 		}
 
-		instance.Status.NotificationsTransportURLSecret = &notificationTransportURL.Status.SecretName
+		// Set status early for first-time setup so PatchInstance persists it
+		// even on early returns. During rotation (old != current), the status
+		// is only updated by FinalizeSecretRotation at end of reconcile.
+		if instance.Status.NotificationsTransportURLSecret == nil ||
+			*instance.Status.NotificationsTransportURLSecret == notificationTransportURL.Status.SecretName {
+			instance.Status.NotificationsTransportURLSecret = &notificationTransportURL.Status.SecretName
+		}
+
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			notificationTransportURL.Status.SecretName, neutronapi.TransportConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		Log.Info(fmt.Sprintf("Notifications TransportURL %s secret created Successfully ", notificationTransportURL.Name))
 
-		secretVars[instance.Status.TransportURLSecret] = env.SetValue(notificationsTransportURLSecretHash)
+		secretVars[currentTransportSecret] = env.SetValue(notificationsTransportURLSecretHash)
 		instance.Status.Conditions.MarkTrue(condition.NotificationBusInstanceReadyCondition, condition.NotificationBusInstanceReadyMessage)
 	} else {
+		if instance.Status.NotificationsTransportURLSecret != nil && *instance.Status.NotificationsTransportURLSecret != "" {
+			if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+				*instance.Status.NotificationsTransportURLSecret, neutronapi.TransportConsumerFinalizer); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		instance.Status.NotificationsTransportURLSecret = nil
 		instance.Status.Conditions.Remove(condition.NotificationBusInstanceReadyCondition)
 
@@ -1066,7 +1126,7 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 
 	transportURLSecretHash, result, err := secret.VerifySecretFields(
 		ctx,
-		types.NamespacedName{Namespace: instance.Namespace, Name: instance.Status.TransportURLSecret},
+		types.NamespacedName{Namespace: instance.Namespace, Name: currentTransportSecret},
 		transportValidateFields,
 		helper.GetClient(),
 		time.Duration(10)*time.Second,
@@ -1088,7 +1148,7 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 		return result, err
 	}
 
-	secretVars[instance.Status.TransportURLSecret] = env.SetValue(transportURLSecretHash)
+	secretVars[currentTransportSecret] = env.SetValue(transportURLSecretHash)
 
 	// run check TransportURL secret - end
 
@@ -1177,7 +1237,7 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 	//
 	// reconcile external secrets and mark condition
 	//
-	err = r.reconcileExternalSecrets(ctx, helper, instance, &secretVars)
+	err = r.reconcileExternalSecrets(ctx, helper, instance, &secretVars, currentTransportSecret)
 	if err != nil {
 		Log.Error(err, "Failed to reconcile external Secrets")
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -1251,7 +1311,11 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 	}
 
 	// Handle service init
-	ctrlResult, err := r.reconcileInit(ctx, instance, helper, serviceLabels, serviceAnnotations, secretVars)
+	var notificationsSecretName *string
+	if notificationTransportURL != nil {
+		notificationsSecretName = &notificationTransportURL.Status.SecretName
+	}
+	ctrlResult, err := r.reconcileInit(ctx, instance, helper, serviceLabels, serviceAnnotations, secretVars, currentTransportSecret, notificationsSecretName)
 	if err != nil {
 		return ctrlResult, err
 	} else if (ctrlResult != ctrl.Result{}) {
@@ -1372,13 +1436,16 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 		}
 		instance.Status.Conditions.MarkTrue(condition.NetworkAttachmentsReadyCondition, condition.NetworkAttachmentsReadyMessage)
 
-		// Mark the Deployment as Ready only if the number of Replicas is equals
-		// to the Deployed instances (ReadyCount), and the the Status.Replicas
-		// match Status.ReadyReplicas. If a deployment update is in progress,
-		// Replicas > ReadyReplicas.
-		// In addition, make sure the controller sees the last Generation
-		// by comparing it with the ObservedGeneration.
+		ready := false
 		if deployment.IsReady(deploy) {
+			ready, err = deployment.IsReadyForInput(ctx, r.APIReader,
+				types.NamespacedName{Name: deploy.Name, Namespace: deploy.Namespace},
+				inputHash)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		if ready {
 			instance.Status.Conditions.MarkTrue(
 				condition.DeploymentReadyCondition,
 				condition.DeploymentReadyMessage,
@@ -1401,24 +1468,56 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 			return ctrl.Result{}, err
 		}
 	}
-	// Manage the old AC secret's finalizer and status tracking.
-	// On rotation (old != new), only remove the old secret's finalizer after
-	// all sub-services are ready with the new credentials. This prevents
-	// premature revocation during rapid rotations.
-	isRotation := instance.Status.ApplicationCredentialSecret != "" && instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
+	// Guard the rotation on the sub-conditions computed during this reconcile,
+	// not instance.IsReady(): the Ready condition is reset to Unknown by
+	// Conditions.Init() at the top of every reconcile and only recomputed in
+	// the deferred PatchInstance, so IsReady() would always be false here.
+	guardReady := instance.Status.Conditions.AllSubConditionIsTrue()
 
-	if isRotation {
-		allServicesReady := instance.Status.Conditions.AllSubConditionIsTrue()
-		if allServicesReady {
-			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
-				instance.Status.ApplicationCredentialSecret, neutronapi.ACConsumerFinalizer); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
-		}
-	} else {
-		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
+	// Finalize transport URL rotation
+	transportSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		currentTransportSecret,
+		neutronapi.TransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	instance.Status.TransportURLSecret = transportSecretName
+
+	// Finalize notifications transport URL rotation
+	if notificationTransportURL != nil {
+		oldNotifSecret := ""
+		if instance.Status.NotificationsTransportURLSecret != nil {
+			oldNotifSecret = *instance.Status.NotificationsTransportURLSecret
+		}
+		currentNotifSecret := notificationTransportURL.Status.SecretName
+		notifSecretName, err := object.FinalizeSecretRotation(
+			ctx, helper, instance.Namespace,
+			oldNotifSecret,
+			currentNotifSecret,
+			neutronapi.TransportConsumerFinalizer,
+			guardReady,
+		)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		instance.Status.NotificationsTransportURLSecret = &notifSecretName
+	}
+
+	acSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.ApplicationCredentialSecret,
+		instance.Spec.Auth.ApplicationCredentialSecret,
+		neutronapi.ACConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.ApplicationCredentialSecret = acSecretName
 
 	// We reached the end of the Reconcile, update the Ready condition based on
 	// the sub conditions
@@ -1635,8 +1734,9 @@ func (r *NeutronAPIReconciler) reconcileExternalSriovAgentSecret(
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
+	transportURLSecretName string,
 ) error {
-	transportURL, quorumQueues, err := r.getTransportURL(ctx, h, instance, &instance.Status.TransportURLSecret)
+	transportURL, quorumQueues, err := r.getTransportURL(ctx, h, instance, &transportURLSecretName)
 	if err != nil {
 		err = r.deleteExternalSecret(ctx, h, instance, getSriovAgentSecretName(instance))
 		if err != nil {
@@ -1656,8 +1756,9 @@ func (r *NeutronAPIReconciler) reconcileExternalDhcpAgentSecret(
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
+	transportURLSecretName string,
 ) error {
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, transportURLSecretName, instance.Namespace)
 	if err != nil {
 		err = r.deleteExternalSecret(ctx, h, instance, getDhcpAgentSecretName(instance))
 		if err != nil {
@@ -1688,14 +1789,15 @@ func (r *NeutronAPIReconciler) reconcileExternalSecrets(
 	h *helper.Helper,
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
+	transportURLSecretName string,
 ) error {
 	Log := r.GetLogger(ctx)
 	// Generate one Secret per external service
-	err := r.reconcileExternalSriovAgentSecret(ctx, h, instance, envVars)
+	err := r.reconcileExternalSriovAgentSecret(ctx, h, instance, envVars, transportURLSecretName)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile Neutron SR-IOV Agent external Secret: %w", err)
 	}
-	err = r.reconcileExternalDhcpAgentSecret(ctx, h, instance, envVars)
+	err = r.reconcileExternalDhcpAgentSecret(ctx, h, instance, envVars, transportURLSecretName)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile Neutron DHCP Agent external Secret: %w", err)
 	}
@@ -1868,6 +1970,8 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
 	db *mariadbv1.Database,
+	transportURLSecretName string,
+	notificationsTransportURLSecretName *string,
 ) error {
 	// Create/update secrets from templates
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(neutronapi.ServiceName), map[string]string{})
@@ -1899,7 +2003,7 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 		return err
 	}
 
-	transportURL, quorumQueues, err := r.getTransportURL(ctx, h, instance, &instance.Status.TransportURLSecret)
+	transportURL, quorumQueues, err := r.getTransportURL(ctx, h, instance, &transportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.InputReadyCondition,
@@ -1932,7 +2036,7 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 	templateParameters["TimeOut"] = instance.Spec.APITimeout
 	templateParameters["QuorumQueues"] = quorumQueues
 
-	notificationsTransportURL, _, err := r.getTransportURL(ctx, h, instance, instance.Status.NotificationsTransportURLSecret)
+	notificationsTransportURL, _, err := r.getTransportURL(ctx, h, instance, notificationsTransportURLSecretName)
 	if err != nil && !errors.Is(err, errTransportURLSecretNameNilOrEmpty) {
 		// in case not configured yet.
 		return err
