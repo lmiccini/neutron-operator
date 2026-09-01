@@ -535,7 +535,7 @@ func (r *NeutronAPIReconciler) reconcileInit(
 	//
 	// create Secret required for neutronapi and dbsync input. It contains minimal neutron config required
 	// to get the service up, user can add additional files to be added to the service.
-	err = r.generateServiceSecrets(ctx, helper, instance, &secretVars, db)
+	err = r.generateServiceSecrets(ctx, helper, instance, &secretVars, db, serviceLabels, serviceAnnotations)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -1314,7 +1314,7 @@ func (r *NeutronAPIReconciler) reconcileNormal(ctx context.Context, instance *ne
 		instance.Status.LastAppliedTopology = nil
 	}
 
-	wsgi := instance.IsWSGI()
+	wsgi := neutronapi.IsWSGIEffective(ctx, helper, instance, serviceLabels, serviceAnnotations)
 
 	deplDef, err := neutronapi.Deployment(instance, inputHash, serviceLabels, serviceAnnotations, topology, memcached, wsgi)
 	if err != nil {
@@ -2023,6 +2023,8 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 	instance *neutronv1beta1.NeutronAPI,
 	envVars *map[string]env.Setter,
 	db *mariadbv1.Database,
+	serviceLabels map[string]string,
+	serviceAnnotations map[string]string,
 ) error {
 	// Create/update secrets from templates
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(neutronapi.ServiceName), map[string]string{})
@@ -2086,7 +2088,7 @@ func (r *NeutronAPIReconciler) generateServiceSecrets(
 	templateParameters["MemcachedTLS"] = mc.GetMemcachedTLSSupport()
 	templateParameters["TimeOut"] = instance.Spec.APITimeout
 	templateParameters["QuorumQueues"] = quorumQueues
-	templateParameters["WSGI"] = instance.IsWSGI()
+	templateParameters["WSGI"] = neutronapi.IsWSGIEffective(ctx, h, instance, serviceLabels, serviceAnnotations)
 
 	notificationsTransportURL, _, err := r.getTransportURL(ctx, h, instance, instance.Status.NotificationsTransportURLSecret)
 	if err != nil && !errors.Is(err, errTransportURLSecretNameNilOrEmpty) {
